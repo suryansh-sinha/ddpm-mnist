@@ -1,0 +1,23 @@
+# -- Python Artifacts --
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# -- Environment and Project Management --
+.venv/
+.env
+
+# -- Data and Large Datasets --
+data/
+
+# -- ML Training Outputs & Weights --
+*.pt
+*.pth
+*.safetensors
+
+# -- IDEs and System Files --
+.vscode/
+.DS_Store
