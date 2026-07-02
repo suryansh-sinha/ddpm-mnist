@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 class TimeEmbedding(nn.Module):
 
-    def __init__(self, time_emb_dim):
+    def __init__(self, time_emb_dim: int):
         super().__init__()
         self.time_emb_dim = time_emb_dim
         self.global_time_dim = self.time_emb_dim * 4
@@ -14,7 +14,7 @@ class TimeEmbedding(nn.Module):
         self.act = nn.SiLU()
         self.linear2 = nn.Linear(self.global_time_dim, self.global_time_dim)
 
-    def sinusoidal_time_embedding(self, time_steps):
+    def sinusoidal_time_embedding(self, time_steps: torch.Tensor):
         """
             The even odd rule is for the dimension index i and not the timestep t.
             for each timestep t, we calculate the sin and cos in alternate manner
@@ -22,9 +22,9 @@ class TimeEmbedding(nn.Module):
             The formula is - sin(t / 10000^(2i/d_model)) for 2i and cos(t / 10000^(2i/d_model)) for 2i+1.
             Here, i ranges from 0 to time_emb_dim // 2 
             Inputs:|
-                time_steps: Batched integer timesteps for images of shape [B,]
+                time_steps (torch.Tensor): Batched integer timesteps for images of shape [B,]
             Outputs:
-                emb: batched embedding for input timesteps, has shape [B, time_emb_dim]
+                emb (torch.Tensor): batched embedding for input timesteps, has shape [B, time_emb_dim]
         """
         # Since the argument inside the sin or cos function --> (t / 10000^(2i/d_model))
         # is basically just (t * frequency). We already have t so we need to calculate frequency part that depends on i.
@@ -112,7 +112,6 @@ class AttentionBlock(nn.Module):
     #     attn_score = torch.softmax(scaled, dim=-1)  #[B, n_heads, seq_len, seq_len]
     #     return attn_score @ v   # [B, n_heads, seq_len, seq_len] @ [B, n_heads, seq_len, head_dim] --> [B, n_heads, seq_len, head_dim]
 
-
     def forward(self, fmap):
         # reshape from [B, C, H, W] to [B, C(input_dim), H*W (seq_len)]
         seq = torch.flatten(self.norm(fmap), start_dim=2, end_dim=-1).permute(0, 2, 1)  # [B, seq_len(H*W), input_dim(C)]
@@ -147,7 +146,7 @@ class UNet(nn.Module):
         self.qkv_dim = qkv_dim
         self.n_heads = n_heads
         self.num_groups = num_groups
-        self.channel_prog = [128, 256]
+        self.channel_prog = [base_channels*2, base_channels*4]  # [128, 256]
 
         # Define the stem
         self.stem = nn.Conv2d(self.in_channels, self.base_channels, kernel_size=3, stride=1, padding=1)
