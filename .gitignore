@@ -20,4 +20,5 @@ data/
 
 # -- IDEs and System Files --
 .vscode/
+.continue
 .DS_Store
