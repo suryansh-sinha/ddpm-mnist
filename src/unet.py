@@ -198,13 +198,10 @@ class UNet(nn.Module):
 
         # Skip connection 1
         d = torch.concat((bottleneck, skip_features[1]), dim=1)    # [B, 256, 14, 14] + [B, 256, 14, 14] = [B, 512, 14, 14]
-        
         # [B, 512, 14, 14] -> [B, 256, 14, 14] -> [B, 128, 14, 14] -> [B, 128, 28, 28]
         d = self.upsample(self.res1_d2(self.res2_d2(d, time_emb), time_emb))
-        
         # Skip connection 2
         d = torch.concat((d, skip_features[0]), dim=1)  # [B, 128, 28, 28] + [B, 128, 28, 28] = [B, 256, 28, 28]
-
         # [B, 256, 28, 28] -> [B, 128, 28, 28] -> [B, base, 28, 28]
         d = self.res1_d1(self.res2_d1(d, time_emb), time_emb)
 
