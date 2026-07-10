@@ -146,10 +146,10 @@ class UNet(nn.Module):
         self.qkv_dim = qkv_dim
         self.n_heads = n_heads
         self.num_groups = num_groups
-        self.channel_prog = [base_channels*2, base_channels*4]  # [128, 256]
+        self.channel_prog = [base_channels*2, base_channels*4, base_channels*8, base_channels*16]  # [32, 64, 128, 256]
 
         # Define the stem
-        self.stem = nn.Conv2d(self.in_channels, self.base_channels, kernel_size=3, stride=1, padding=1)
+        self.stem = nn.Conv2d(self.in_channels, self.base_channels, kernel_size=3, stride=2, padding=1)
 
         # Define time embedding
         self.time_emb_layer = TimeEmbedding(self.time_emb_dim)  # Outputs embedding -> [B, self.time_emb_dim * 4]
@@ -162,47 +162,73 @@ class UNet(nn.Module):
         self.res1_e2 = ResBlock(self.channel_prog[0], self.channel_prog[1], self.global_time_emb, self.num_groups)
         self.res2_e2 = ResBlock(self.channel_prog[1], self.channel_prog[1], self.global_time_emb, self.num_groups)
         self.downsample2 = nn.Conv2d(self.channel_prog[1], self.channel_prog[1], kernel_size=3, stride=2, padding=1)
+        self.res1_e3 = ResBlock(self.channel_prog[1], self.channel_prog[2], self.global_time_emb, self.num_groups)
+        self.res2_e3 = ResBlock(self.channel_prog[2], self.channel_prog[2], self.global_time_emb, self.num_groups)
+        self.downsample3 = nn.Conv2d(self.channel_prog[2], self.channel_prog[2], kernel_size=3, stride=2, padding=1)
+        self.res1_e4 = ResBlock(self.channel_prog[2], self.channel_prog[3], self.global_time_emb, self.num_groups)
+        self.res2_e4 = ResBlock(self.channel_prog[3], self.channel_prog[3], self.global_time_emb, self.num_groups)
+        self.downsample4 = nn.Conv2d(self.channel_prog[3], self.channel_prog[3], kernel_size=3, stride=2, padding=1)
 
         # Define the bottleneck blocks
-        self.res1_b = ResBlock(self.channel_prog[1], self.channel_prog[1], self.global_time_emb, self.num_groups)
-        self.attn1 = AttentionBlock(self.channel_prog[1], self.qkv_dim, self.n_heads, self.num_groups)
-        self.res2_b = ResBlock(self.channel_prog[1], self.channel_prog[1], self.global_time_emb, self.num_groups)
-        self.attn2 = AttentionBlock(self.channel_prog[1], self.qkv_dim, self.n_heads, self.num_groups)
+        self.res1_b = ResBlock(self.channel_prog[3], self.channel_prog[3], self.global_time_emb, self.num_groups)
+        self.attn1 = AttentionBlock(self.channel_prog[3], self.qkv_dim, self.n_heads, self.num_groups)
+        self.res2_b = ResBlock(self.channel_prog[3], self.channel_prog[3], self.global_time_emb, self.num_groups)
+        self.attn2 = AttentionBlock(self.channel_prog[3], self.qkv_dim, self.n_heads, self.num_groups)
 
         # Define the decoder blocks
         self.upsample = nn.Upsample(scale_factor = 2, mode="nearest")   # Since we want to increase 2x height and 2x width
+        self.res2_d4 = ResBlock(self.channel_prog[3]*2, self.channel_prog[3], self.global_time_emb, self.num_groups)
+        self.res1_d4 = ResBlock(self.channel_prog[3], self.channel_prog[2], self.global_time_emb, self.num_groups)
+        self.res2_d3 = ResBlock(self.channel_prog[2]*2, self.channel_prog[2], self.global_time_emb, self.num_groups)
+        self.res1_d3 = ResBlock(self.channel_prog[2], self.channel_prog[1], self.global_time_emb, self.num_groups)
         self.res2_d2 = ResBlock(self.channel_prog[1]*2, self.channel_prog[1], self.global_time_emb, self.num_groups)
         self.res1_d2 = ResBlock(self.channel_prog[1], self.channel_prog[0], self.global_time_emb, self.num_groups)
         self.res2_d1 = ResBlock(self.channel_prog[0]*2, self.channel_prog[0], self.global_time_emb, self.num_groups)
         self.res1_d1 = ResBlock(self.channel_prog[0], self.base_channels, self.global_time_emb, self.num_groups)
 
         # Final Conv to convert from base_channels to single channel
-        self.linearOut = nn.Conv2d(base_channels, 1, kernel_size=1, stride=1, padding=0)
+        self.linearOut = nn.Conv2d(base_channels, in_channels, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x, time_steps):
 
         time_emb = self.time_emb_layer(time_steps)
 
         skip_features = []
-        # [B, 1, 28, 28] -> [B, base, 28, 28] -> [B, 128, 28, 28] -> [B, 128, 28, 28]
+        # [B, 3, 1024, 1024] -> [B, base, 512, 512] -> [B, 32, 512, 512] -> [B, 32, 512, 512]
         e = self.res2_e1(self.res1_e1(self.stem(x), time_emb), time_emb)
-        skip_features.append(e)    # Saved e1 -> torch.Size([B, 128, 28, 28])
-        e = self.downsample1(e)    # [B, 128, 28, 28] -> [B, 128, 14, 14]
-        # [B, 128, 14, 14] -> [B, 256, 14, 14] -> [B, 256, 14, 14]
+        skip_features.append(e)    # Saved e1 -> torch.Size([B, 32, 512, 512])
+        e = self.downsample1(e)    # [B, 32, 512, 512] -> [B, 32, 256, 256]
+        # [B, 32, 256, 256] -> [B, 64, 256, 256] -> [B, 64, 256, 256]
         e = self.res2_e2(self.res1_e2(e, time_emb), time_emb)
-        skip_features.append(e)    # Saved e2 -> torch.Size([B, 256, 14, 14])
-        e = self.downsample2(e)    # [B, 256, 14, 14] -> [B, 256, 7, 7]
+        skip_features.append(e)    # Saved e2 -> torch.Size([B, 64, 256, 256])
+        e = self.downsample2(e)    # [B, 64, 256, 256] -> [B, 64, 128, 128]
+        # [B, 64, 128, 128] -> [B, 128, 128, 128] -> [B, 128, 128, 128]
+        e = self.res2_e3(self.res1_e3(e, time_emb), time_emb)
+        skip_features.append(e)    # Saved e3 -> torch.Size([B, 128, 128, 128])
+        e = self.downsample3(e)    # [B, 128, 128, 128] -> [B, 128, 64, 64]
+        # [B, 128, 64, 64] -> [B, 256, 64, 64] -> 
+        e = self.res2_e4(self.res1_e4(e, time_emb), time_emb)
+        skip_features.append(e)    # Saved e4 -> torch.Size([B, 256, 64, 64])
+        e = self.downsample4(e)    # [B, 256, 64, 64] -> [B, 256, 32, 32]
 
-        bottleneck = self.attn1(self.res1_b(e, time_emb))   # [B, 256, 7, 7] -> [B, 256, 7, 7]
-        bottleneck = self.upsample(self.attn2(self.res2_b(bottleneck, time_emb)))   # [B, 256, 7, 7] -> [B, 256, 14, 14]
+        bottleneck = self.attn1(self.res1_b(e, time_emb))   # [B, 256, 32, 32] -> [B, 256, 32, 32]
+        bottleneck = self.upsample(self.attn2(self.res2_b(bottleneck, time_emb)))   # [B, 256, 32, 32] -> [B, 256, 64, 64]
 
         # Skip connection 1
-        d = torch.concat((bottleneck, skip_features[1]), dim=1)    # [B, 256, 14, 14] + [B, 256, 14, 14] = [B, 512, 14, 14]
-        # [B, 512, 14, 14] -> [B, 256, 14, 14] -> [B, 128, 14, 14] -> [B, 128, 28, 28]
-        d = self.upsample(self.res1_d2(self.res2_d2(d, time_emb), time_emb))
+        d = torch.concat((bottleneck, skip_features[3]), dim=1)    # [B, 256, 64, 64] + [B, 256, 64, 64] = [B, 512, 64, 64]
+        # [B, 512, 64, 64] -> [B, 256, 64, 64] -> [B, 128, 64, 64] -> [B, 128, 128, 128]
+        d = self.upsample(self.res1_d4(self.res2_d4(d, time_emb), time_emb))
         # Skip connection 2
-        d = torch.concat((d, skip_features[0]), dim=1)  # [B, 128, 28, 28] + [B, 128, 28, 28] = [B, 256, 28, 28]
-        # [B, 256, 28, 28] -> [B, 128, 28, 28] -> [B, base, 28, 28]
-        d = self.res1_d1(self.res2_d1(d, time_emb), time_emb)
+        d = torch.concat((d, skip_features[2]), dim=1)    # [B, 128, 128, 128] + [B, 128, 128, 128] = [B, 256, 128, 128]
+        # [B, 256, 128, 128] -> [B, 128, 128, 128] -> [B, 64, 128, 128] -> [B, 64, 256, 256]
+        d = self.upsample(self.res1_d3(self.res2_d3(d, time_emb), time_emb))
+        # Skip connection 3
+        d = torch.concat((d, skip_features[1]), dim=1)    # [B, 64, 256, 256] + [B, 64, 256, 256] = [B, 128, 256, 256]
+        # [B, 128, 256, 256] -> [B, 64, 256, 256] -> [B, 32, 256, 256] -> [B, 32, 512, 512]
+        d = self.upsample(self.res1_d2(self.res2_d2(d, time_emb), time_emb))
+        # Skip connection 4
+        d = torch.concat((d, skip_features[0]), dim=1)  # [B, 32, 512, 512] + [B, 32, 512, 512] = [B, 64, 512, 512]
+        # [B, 64, 512, 512] -> [B, 32, 512, 512] -> [B, base, 512, 512] -> [B, base, 1024, 1024]
+        d = self.upsample(self.res1_d1(self.res2_d1(d, time_emb), time_emb))
 
-        return self.linearOut(d)
+        return self.linearOut(d)    # [B, base, 1024, 1024] -> [B, 3, 1024, 1024]
