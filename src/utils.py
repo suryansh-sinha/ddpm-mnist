@@ -1,6 +1,6 @@
 import matplotlib.pyplot as plt
 import torch
-from diffusion import LinearNoiseScheduler
+from src.diffusion import LinearNoiseScheduler
 
 def visualize_forward_diffusion(data_loader: torch.utils.data.DataLoader):
     """Selects a random image from the dataloader and then applies the forward diffusion process to it,
