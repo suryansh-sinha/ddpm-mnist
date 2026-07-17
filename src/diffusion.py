@@ -46,9 +46,19 @@ class LinearNoiseScheduler:
             noise = sigma_1.reshape(-1, 1, 1, 1) * torch.randn((batch_size, img_channels, img_size, img_size)).to(self.device)
             unet_pred_noise = unet(x_t, T)
 
-            if t == 0:
+            # Rearrange x_t = sqrt_alpha_bar[t] * x0 + sqrt_one_minus_alpha_bar * noise so x0 is on LHS.
+            # eqn 15 in paper
+            estimated_x0 = (1/torch.sqrt(self.alpha_bars[T])).reshape(-1, 1, 1, 1) * (x_t - (self.sqrt_one_minus_alpha_bars[T].reshape(-1, 1, 1, 1) * unet_pred_noise))
+            estimated_x0 = torch.clamp(estimated_x0, -1., 1.)   # Since clean img can only have values in range (-1, 1)
+
+            if t != 0:
+                # Calculate true mathematical posterior mean using eqn 7
+                mean = ((self.sqrt_alpha_bars[T-1]*self.betas[T])/(1.-self.alpha_bars[T])).reshape(-1, 1, 1, 1) * estimated_x0 \
+                   + ((torch.sqrt(self.alphas[T]) * (1. - self.alpha_bars[T-1]))/(1. - self.alpha_bars[T])).reshape(-1, 1, 1, 1) * x_t
+            else:
+                mean = estimated_x0
                 noise = torch.zeros_like(noise).to(self.device)
 
-            x_t = (1/torch.sqrt(self.alphas[T])).reshape(-1, 1, 1, 1) * (x_t - ((self.betas[T]/self.sqrt_one_minus_alpha_bars[T]).reshape(-1, 1, 1, 1) * unet_pred_noise)) + noise
+            x_t = mean + noise  # x_t-1 = posterior mean (depends on estimated x0, xt) + variance * noise from normal dist
 
         return x_t

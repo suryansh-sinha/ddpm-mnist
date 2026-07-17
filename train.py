@@ -1,5 +1,5 @@
 import torch
-import torch.nn.functional as F
+from torchvision.utils import make_grid
 from torch.utils.data import DataLoader
 from torchvision.transforms import v2
 from src.unet import UNet
@@ -108,12 +108,11 @@ for epoch in range(EPOCHS):
             print(f"Batch: {batch_idx}/{len(train_loader)} | Loss: {loss.item():.5f}")
 
         train_loss += loss.item() * x_0.size(0)
-        wandb.log({"batch_loss": train_loss, "batch_idx": batch_idx})
+        wandb.log({"batch_loss": loss.item(), "batch_idx": batch_idx})
         total_imgs += x_0.size(0)
     
     # In case the total dataset size is not divisible by batch_size, we explicitly count number of images in last batch and add them for correct division to get epoch_loss
     epoch_train_loss = train_loss / (total_imgs)
-    wandb.log({"epoch_loss": epoch_train_loss, "epoch": epoch})
 
     # Saving best performing model
     if epoch_train_loss < best_loss:
@@ -128,8 +127,13 @@ for epoch in range(EPOCHS):
         # sampling logic
         ema_model.eval()
         with torch.inference_mode():
-            generated = lns.sampling(ema_model.module)
-        # log generated samples to w&b
+            generated = lns.sampling(ema_model.module, fixed_noise)
+            generated = (generated + 1)/2
+            img_grid = make_grid(generated).to(torch.device('cpu'))
+            # log generated samples to w&b
+            wandb.log({"epoch_loss": epoch_train_loss, "epoch": epoch, "validation_samples": wandb.Image(img_grid, caption=f'Sampled at epoch: {epoch+1}')})
+    else:
+        wandb.log({"epoch_loss": epoch_train_loss, "epoch": epoch})
 
 # Create the plot
 # plt.figure(figsize=(16, 10))
