@@ -25,7 +25,7 @@ transform = v2.Compose([
 dataset = TransistorDataset(img_dir="./data/transistor/train/good/", transform=transform)
 
 # Hyperparameters
-BATCH_SIZE = 4
+BATCH_SIZE = 2
 LR = 2e-4   # paper default
 EPOCHS = 1000
 NUM_TIMESTEPS = 1000
@@ -83,42 +83,44 @@ losses = []
 for epoch in range(EPOCHS):
 
     model.train()   # Set model to training mode
+    ema_model.train()
     train_loss = 0.0
     total_imgs = 0
+    
+    for batch_idx, x_0 in enumerate(train_loader):
+        optimizer.zero_grad()
+        x_0 = x_0.to(DEVICE)
+        
+        # t ~ Uniform ({1...T})
+        t = torch.randint(low=0, high=NUM_TIMESTEPS, size=(x_0.size(0), )).to(DEVICE)
 
-    with autocast(device_type="cuda", dtype=torch.bfloat16):
-        for batch_idx, x_0 in enumerate(train_loader):
-            optimizer.zero_grad()
-            x_0 = x_0.to(DEVICE)
-            
-            # t ~ Uniform ({1...T})
-            t = torch.randint(low=0, high=NUM_TIMESTEPS, size=(x_0.size(0), )).to(DEVICE)
+        # noise ~ N(0, I)
+        noise = torch.randn_like(x_0).to(DEVICE)
 
-            # noise ~ N(0, I)
-            noise = torch.randn_like(x_0).to(DEVICE)
-
-            # forward diffusion process
-            x_t = lns.add_noise(x_0, noise, t)
-
-            
+        # forward diffusion process
+        x_t = lns.add_noise(x_0, noise, t)
+        
+        with autocast(device_type="cuda", dtype=torch.bfloat16):
             # Loss -> ||noise - unet_pred(add_noise function to timesteps t, timestep t itself)|| ** 2
             predicted_noise = model(x_t, t) # getting model prediction
             loss = criterion(predicted_noise, noise)
 
-            loss.backward()     # calculate gradients
-            optimizer.step()    # update model parameters
+        loss.backward()     # calculate gradients
+        optimizer.step()    # update model parameters
 
-            ema_model.update_parameters(model)
+        ema_model.update_parameters(model)
 
-            if (batch_idx) % 10 == 0:
-                print(f"Batch: {batch_idx}/{len(train_loader)} | Loss: {loss.item():.5f}")
+        train_loss += loss.item() * x_0.size(0)
+        total_imgs += x_0.size(0)
 
-            train_loss += loss.item() * x_0.size(0)
-            wandb.log({"batch_loss": loss.item(), "batch_idx": batch_idx})
-            total_imgs += x_0.size(0)
+        if (batch_idx) % 10 == 0:
+            print(f"Batch: {batch_idx}/{len(train_loader)} | Loss: {loss.item():.5f}")
+
+        wandb.log({"batch_loss": loss.item(), "batch_idx": batch_idx})
+            
     
     # In case the total dataset size is not divisible by batch_size, we explicitly count number of images in last batch and add them for correct division to get epoch_loss
-    epoch_train_loss = train_loss / (total_imgs)
+    epoch_train_loss = train_loss/total_imgs
 
     # Saving best performing model
     if epoch_train_loss < best_loss:
