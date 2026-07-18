@@ -5,6 +5,7 @@ from torchvision.transforms import v2
 from src.unet import UNet
 from src.load_data import TransistorDataset
 from src.diffusion import LinearNoiseScheduler
+from torch.amp import autocast
 from src.utils import save_model_checkpoint
 
 import os
@@ -16,6 +17,7 @@ load_dotenv()
 
 # Loading our dataset
 transform = v2.Compose([
+    v2.Resize((512, 512)),
     v2.RandomHorizontalFlip(),
     v2.Lambda(lambda x: x*2 - 1)
 ])
@@ -25,14 +27,15 @@ dataset = TransistorDataset(img_dir="./data/transistor/train/good/", transform=t
 # Hyperparameters
 BATCH_SIZE = 4
 LR = 2e-4   # paper default
-EPOCHS = 10
+EPOCHS = 1000
 NUM_TIMESTEPS = 1000
 BETA_START = 1e-4
 BETA_END = 0.02
-IMG_SIZE = 1024
+IMG_SIZE = 512
 IN_CHANNELS = 3
-BASE_CHANNELS = 16  # paper used 128
-TIME_EMB_DIM = 128
+BASE_CHANNELS = 64  # paper used 128
+DEPTH = 4
+SINUSOIDAL_TIME_EMB_DIM = 128
 EMB_DIM = 256
 N_HEADS = 8
 NUM_GROUPS = 8
@@ -48,7 +51,8 @@ config = {
     "IMG_SIZE": IMG_SIZE,
     "IN_CHANNELS": IN_CHANNELS,
     "BASE_CHANNELS": BASE_CHANNELS,
-    "TIME_EMB_DIM": TIME_EMB_DIM,
+    "DEPTH": DEPTH,
+    "SINUSOIDAL_TIME_EMB_DIM": SINUSOIDAL_TIME_EMB_DIM,
     "EMB_DIM": EMB_DIM,
     "N_HEADS": N_HEADS,
     "NUM_GROUPS": NUM_GROUPS,
@@ -60,7 +64,7 @@ wandb.init(project='DDPM-MVTecAD', config=config)
 
 # Objects
 lns = LinearNoiseScheduler(NUM_TIMESTEPS, BETA_START, BETA_END, DEVICE)
-model = UNet(IN_CHANNELS, BASE_CHANNELS, TIME_EMB_DIM, EMB_DIM, N_HEADS, NUM_GROUPS).to(DEVICE)
+model = UNet(IN_CHANNELS, BASE_CHANNELS, SINUSOIDAL_TIME_EMB_DIM, EMB_DIM, N_HEADS, NUM_GROUPS, DEPTH).to(DEVICE)
 optimizer = torch.optim.Adam(model.parameters(), lr = LR)
 ema_model = torch.optim.swa_utils.AveragedModel(
     model, 
@@ -82,34 +86,36 @@ for epoch in range(EPOCHS):
     train_loss = 0.0
     total_imgs = 0
 
-    for batch_idx, x_0 in enumerate(train_loader):
-        optimizer.zero_grad()
-        x_0 = x_0.to(DEVICE)
-        
-        # t ~ Uniform ({1...T})
-        t = torch.randint(low=0, high=NUM_TIMESTEPS, size=(x_0.size(0), )).to(DEVICE)
+    with autocast(device_type="cuda", dtype=torch.bfloat16):
+        for batch_idx, x_0 in enumerate(train_loader):
+            optimizer.zero_grad()
+            x_0 = x_0.to(DEVICE)
+            
+            # t ~ Uniform ({1...T})
+            t = torch.randint(low=0, high=NUM_TIMESTEPS, size=(x_0.size(0), )).to(DEVICE)
 
-        # noise ~ N(0, I)
-        noise = torch.randn_like(x_0).to(DEVICE)
+            # noise ~ N(0, I)
+            noise = torch.randn_like(x_0).to(DEVICE)
 
-        # forward diffusion process
-        x_t = lns.add_noise(x_0, noise, t)
+            # forward diffusion process
+            x_t = lns.add_noise(x_0, noise, t)
 
-        # Loss -> ||noise - unet_pred(add_noise function to timesteps t, timestep t itself)|| ** 2
-        predicted_noise = model(x_t, t) # getting model prediction
-        loss = criterion(predicted_noise, noise)
+            
+            # Loss -> ||noise - unet_pred(add_noise function to timesteps t, timestep t itself)|| ** 2
+            predicted_noise = model(x_t, t) # getting model prediction
+            loss = criterion(predicted_noise, noise)
 
-        loss.backward()     # calculate gradients
-        optimizer.step()    # update model parameters
+            loss.backward()     # calculate gradients
+            optimizer.step()    # update model parameters
 
-        ema_model.update_parameters(model)
+            ema_model.update_parameters(model)
 
-        if (batch_idx) % 6 == 0:
-            print(f"Batch: {batch_idx}/{len(train_loader)} | Loss: {loss.item():.5f}")
+            if (batch_idx) % 10 == 0:
+                print(f"Batch: {batch_idx}/{len(train_loader)} | Loss: {loss.item():.5f}")
 
-        train_loss += loss.item() * x_0.size(0)
-        wandb.log({"batch_loss": loss.item(), "batch_idx": batch_idx})
-        total_imgs += x_0.size(0)
+            train_loss += loss.item() * x_0.size(0)
+            wandb.log({"batch_loss": loss.item(), "batch_idx": batch_idx})
+            total_imgs += x_0.size(0)
     
     # In case the total dataset size is not divisible by batch_size, we explicitly count number of images in last batch and add them for correct division to get epoch_loss
     epoch_train_loss = train_loss / (total_imgs)
@@ -120,26 +126,19 @@ for epoch in range(EPOCHS):
         save_model_checkpoint("./outputs/best.pt", epoch, model, ema_model, optimizer, losses)
 
     losses.append(epoch_train_loss)
+    print("-" * 60)
+    print(f"Epoch: {epoch+1}/{EPOCHS} | Loss: {epoch_train_loss:.5f}")
+    print("-" * 60)
 
-    if (epoch+1) % 2 == 0:
-        print(f"Epoch: {epoch+1}/{EPOCHS} | Loss: {epoch_train_loss:.5f}")
+    if (epoch+1) % 50 == 0:
         save_model_checkpoint(f"./outputs/model_epoch_{epoch+1}.pt", epoch, model, ema_model, optimizer, losses)
         # sampling logic
         ema_model.eval()
         with torch.inference_mode():
             generated = lns.sampling(ema_model.module, fixed_noise)
             generated = (generated + 1)/2
-            img_grid = make_grid(generated).to(torch.device('cpu'))
+            img_grid = make_grid(generated, 4).to(torch.device('cpu'))
             # log generated samples to w&b
             wandb.log({"epoch_loss": epoch_train_loss, "epoch": epoch, "validation_samples": wandb.Image(img_grid, caption=f'Sampled at epoch: {epoch+1}')})
     else:
         wandb.log({"epoch_loss": epoch_train_loss, "epoch": epoch})
-
-# Create the plot
-# plt.figure(figsize=(16, 10))
-# plt.plot(losses, label='Training Loss', color='blue', linewidth=2)
-# plt.title("Loss Curve")
-# plt.xlabel("epochs")
-# plt.ylabel("loss")
-# plt.grid(True, linestyle='--', alpha=0.6)
-# plt.show()

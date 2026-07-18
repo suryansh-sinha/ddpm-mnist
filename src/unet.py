@@ -6,13 +6,12 @@ class TimeEmbedding(nn.Module):
 
     def __init__(self, time_emb_dim: int):
         super().__init__()
-        self.time_emb_dim = time_emb_dim
-        self.global_time_dim = self.time_emb_dim * 4
+        self.time_emb_dim = time_emb_dim    # Sinusoidal time embedding dimension.
 
         # 2 Layer MLP
-        self.linear1 = nn.Linear(self.time_emb_dim, self.global_time_dim)
+        self.linear1 = nn.Linear(time_emb_dim, time_emb_dim * 4)
         self.act = nn.SiLU()
-        self.linear2 = nn.Linear(self.global_time_dim, self.global_time_dim)
+        self.linear2 = nn.Linear(time_emb_dim * 4, time_emb_dim * 4)
 
     def sinusoidal_time_embedding(self, time_steps: torch.Tensor):
         """
@@ -48,11 +47,11 @@ class TimeEmbedding(nn.Module):
 
 class ResBlock(nn.Module):
 
-    def __init__(self, in_channels, out_channels, t_emb_dim, num_groups):
+    def __init__(self, in_channels, out_channels, time_emb_dim, num_groups):
+        r"""
+        time_emb_dim: Expects sinusoidal_time_emb_dim * 4
+        """
         super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.t_emb_dim = t_emb_dim  # Expects global_time_dim now
         
         self.act = nn.SiLU()
 
@@ -60,12 +59,12 @@ class ResBlock(nn.Module):
             raise ValueError("in_channels/out_channels must be divisible by group_norm [Res_Block]")
         
         # To map sinusoidal time embedding to out_channels
-        self.lin = nn.Linear(self.t_emb_dim, self.out_channels)
+        self.lin = nn.Linear(time_emb_dim, out_channels)
         # Define First Conv Group
-        self.norm1 = nn.GroupNorm(num_groups, self.in_channels)
+        self.norm1 = nn.GroupNorm(num_groups, in_channels)
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
         # Define Second Conv Group
-        self.norm2 = nn.GroupNorm(num_groups, self.out_channels)
+        self.norm2 = nn.GroupNorm(num_groups, out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
         # For shortcut connection
         if in_channels != out_channels:
@@ -78,7 +77,7 @@ class ResBlock(nn.Module):
         x1 = self.conv1(self.act(self.norm1(x)))   # First conv step complete
         x1 = x1 + time_emb[..., None, None]        # Time embedding injection complete
         x2 = self.conv2(self.act(self.norm2(x1)))  # Second conv step complete
-        x2 = x2 + self.linearProj(x)               # Shortcut connection complete
+        x2 = x2 + self.linearProj(x)               # Shortacut connection complete
         return self.act(x2)
 
 class AttentionBlock(nn.Module):
@@ -132,103 +131,99 @@ class AttentionBlock(nn.Module):
         out = out.reshape(fmap.shape)   # [B, C, H*W] -> [B, C, H, W]
         return out + fmap   # shortcut connection
 
+# Reducing repeatability
+class DownBlock(nn.Module):
+
+    def __init__(self, in_channels, out_channels, time_emb_dim, num_groups):
+        super().__init__()
+        self.res1 = ResBlock(in_channels, out_channels, time_emb_dim, num_groups)
+        self.res2 = ResBlock(out_channels, out_channels, time_emb_dim, num_groups)
+        self.downsample = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2, padding=1)
+
+    def forward(self, x, time_emb):
+        e = self.res2(self.res1(x, time_emb), time_emb)
+        return self.downsample(e), e    # returning e for skip connection
+    
+class MidBlock(nn.Module):
+
+    def __init__(self, channels, qkv_dim, n_heads, time_emb_dim, num_groups):
+        super().__init__()
+        self.res = ResBlock(channels, channels, time_emb_dim, num_groups)
+        self.attn = AttentionBlock(channels, qkv_dim, n_heads, num_groups)
+
+    def forward(self, x, time_emb):
+        return self.attn(self.res(x, time_emb))
+    
+class UpBlock(nn.Module):
+
+    def __init__(self, in_channels, out_channels, time_emb_dim, num_groups):
+        super().__init__()
+        self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
+        self.res2 = ResBlock(in_channels*2, in_channels, time_emb_dim, num_groups)
+        self.res1 = ResBlock(in_channels, out_channels, time_emb_dim, num_groups)
+
+    def forward(self, x, time_emb, skip_features):
+        x = self.upsample(x)
+        x = torch.concat((x, skip_features.pop()), dim=1)
+        x = self.res1(self.res2(x, time_emb), time_emb)
+        return x
+
 
 # The UNet Class
 class UNet(nn.Module):
 
-    def __init__(self, in_channels, base_channels, time_emb_dim, qkv_dim, n_heads, num_groups):
+    def __init__(self, in_channels, base_channels, sinusoidal_time_emb_dim, qkv_dim, n_heads, num_groups, depth):
         
         super().__init__()
-        
-        self.in_channels = in_channels
-        self.base_channels = base_channels
-        self.time_emb_dim = time_emb_dim
-        self.qkv_dim = qkv_dim
-        self.n_heads = n_heads
-        self.num_groups = num_groups
-        self.channel_prog = [base_channels*2, base_channels*4, base_channels*8, base_channels*16]  # [32, 64, 128, 256]
+        channel_prog = [base_channels * (2**(i)) for i in range(depth)]  # [32, 64, 128, 256]
 
         # Define the stem
-        self.stem = nn.Conv2d(self.in_channels, self.base_channels, kernel_size=3, stride=2, padding=1)
+        self.stem = nn.Conv2d(in_channels, base_channels, kernel_size=3, stride=1, padding=1)
 
         # Define time embedding
-        self.time_emb_layer = TimeEmbedding(self.time_emb_dim)  # Outputs embedding -> [B, self.time_emb_dim * 4]
-        self.global_time_emb = self.time_emb_dim * 4
+        self.time_emb_layer = TimeEmbedding(sinusoidal_time_emb_dim)  # Outputs embedding -> [B, self.time_emb_dim * 4]
+        time_emb_dim = sinusoidal_time_emb_dim * 4
         
         # Define the encoder blocks
-        self.res1_e1 = ResBlock(self.base_channels, self.channel_prog[0], self.global_time_emb, self.num_groups)
-        self.res2_e1 = ResBlock(self.channel_prog[0], self.channel_prog[0], self.global_time_emb, self.num_groups)
-        self.downsample1 = nn.Conv2d(self.channel_prog[0], self.channel_prog[0], kernel_size=3, stride=2, padding=1)        
-        self.res1_e2 = ResBlock(self.channel_prog[0], self.channel_prog[1], self.global_time_emb, self.num_groups)
-        self.res2_e2 = ResBlock(self.channel_prog[1], self.channel_prog[1], self.global_time_emb, self.num_groups)
-        self.downsample2 = nn.Conv2d(self.channel_prog[1], self.channel_prog[1], kernel_size=3, stride=2, padding=1)
-        self.res1_e3 = ResBlock(self.channel_prog[1], self.channel_prog[2], self.global_time_emb, self.num_groups)
-        self.res2_e3 = ResBlock(self.channel_prog[2], self.channel_prog[2], self.global_time_emb, self.num_groups)
-        self.downsample3 = nn.Conv2d(self.channel_prog[2], self.channel_prog[2], kernel_size=3, stride=2, padding=1)
-        self.res1_e4 = ResBlock(self.channel_prog[2], self.channel_prog[3], self.global_time_emb, self.num_groups)
-        self.res2_e4 = ResBlock(self.channel_prog[3], self.channel_prog[3], self.global_time_emb, self.num_groups)
-        self.downsample4 = nn.Conv2d(self.channel_prog[3], self.channel_prog[3], kernel_size=3, stride=2, padding=1)
+        current_channels = base_channels
+        self.encoder_blocks = nn.ModuleList([])
+        for i in channel_prog:
+            self.encoder_blocks.append(DownBlock(current_channels, i, time_emb_dim, num_groups))
+            current_channels = i
+        
 
         # Define the bottleneck blocks
-        self.res1_b = ResBlock(self.channel_prog[3], self.channel_prog[3], self.global_time_emb, self.num_groups)
-        self.attn1 = AttentionBlock(self.channel_prog[3], self.qkv_dim, self.n_heads, self.num_groups)
-        self.res2_b = ResBlock(self.channel_prog[3], self.channel_prog[3], self.global_time_emb, self.num_groups)
-        self.attn2 = AttentionBlock(self.channel_prog[3], self.qkv_dim, self.n_heads, self.num_groups)
+        self.mid_blocks = nn.ModuleList([
+            MidBlock(current_channels, qkv_dim, n_heads, time_emb_dim, num_groups),
+            MidBlock(current_channels, qkv_dim, n_heads, time_emb_dim, num_groups),
+        ])
 
         # Define the decoder blocks
-        self.upsample = nn.Upsample(scale_factor = 2, mode="nearest")   # Since we want to increase 2x height and 2x width
-        self.res2_d4 = ResBlock(self.channel_prog[3]*2, self.channel_prog[3], self.global_time_emb, self.num_groups)
-        self.res1_d4 = ResBlock(self.channel_prog[3], self.channel_prog[2], self.global_time_emb, self.num_groups)
-        self.res2_d3 = ResBlock(self.channel_prog[2]*2, self.channel_prog[2], self.global_time_emb, self.num_groups)
-        self.res1_d3 = ResBlock(self.channel_prog[2], self.channel_prog[1], self.global_time_emb, self.num_groups)
-        self.res2_d2 = ResBlock(self.channel_prog[1]*2, self.channel_prog[1], self.global_time_emb, self.num_groups)
-        self.res1_d2 = ResBlock(self.channel_prog[1], self.channel_prog[0], self.global_time_emb, self.num_groups)
-        self.res2_d1 = ResBlock(self.channel_prog[0]*2, self.channel_prog[0], self.global_time_emb, self.num_groups)
-        self.res1_d1 = ResBlock(self.channel_prog[0], self.base_channels, self.global_time_emb, self.num_groups)
+        self.decoder_blocks = nn.ModuleList([])
+        for i in range(len(channel_prog)-1, -1, -1):
+            if i == 0:
+                self.decoder_blocks.append(UpBlock(channel_prog[i], base_channels, time_emb_dim, num_groups))
+            else:
+                self.decoder_blocks.append(UpBlock(channel_prog[i], channel_prog[i-1], time_emb_dim, num_groups))
 
-        # Final Conv to convert from base_channels to single channel
+        # Final Conv to convert from base_channels to rgb channels
         self.linearOut = nn.Conv2d(base_channels, in_channels, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x, time_steps):
 
         time_emb = self.time_emb_layer(time_steps)
+        x = self.stem(x)
 
         skip_features = []
-        # [B, 3, 1024, 1024] -> [B, base, 512, 512] -> [B, 32, 512, 512] -> [B, 32, 512, 512]
-        e = self.res2_e1(self.res1_e1(self.stem(x), time_emb), time_emb)
-        skip_features.append(e)    # Saved e1 -> torch.Size([B, 32, 512, 512])
-        e = self.downsample1(e)    # [B, 32, 512, 512] -> [B, 32, 256, 256]
-        # [B, 32, 256, 256] -> [B, 64, 256, 256] -> [B, 64, 256, 256]
-        e = self.res2_e2(self.res1_e2(e, time_emb), time_emb)
-        skip_features.append(e)    # Saved e2 -> torch.Size([B, 64, 256, 256])
-        e = self.downsample2(e)    # [B, 64, 256, 256] -> [B, 64, 128, 128]
-        # [B, 64, 128, 128] -> [B, 128, 128, 128] -> [B, 128, 128, 128]
-        e = self.res2_e3(self.res1_e3(e, time_emb), time_emb)
-        skip_features.append(e)    # Saved e3 -> torch.Size([B, 128, 128, 128])
-        e = self.downsample3(e)    # [B, 128, 128, 128] -> [B, 128, 64, 64]
-        # [B, 128, 64, 64] -> [B, 256, 64, 64] -> 
-        e = self.res2_e4(self.res1_e4(e, time_emb), time_emb)
-        skip_features.append(e)    # Saved e4 -> torch.Size([B, 256, 64, 64])
-        e = self.downsample4(e)    # [B, 256, 64, 64] -> [B, 256, 32, 32]
+        for block in self.encoder_blocks:
+            x, skip = block(x, time_emb)
+            skip_features.append(skip)
 
-        bottleneck = self.attn1(self.res1_b(e, time_emb))   # [B, 256, 32, 32] -> [B, 256, 32, 32]
-        bottleneck = self.upsample(self.attn2(self.res2_b(bottleneck, time_emb)))   # [B, 256, 32, 32] -> [B, 256, 64, 64]
+        for block in self.mid_blocks:
+            x = block(x, time_emb)
 
-        # Skip connection 1
-        d = torch.concat((bottleneck, skip_features[3]), dim=1)    # [B, 256, 64, 64] + [B, 256, 64, 64] = [B, 512, 64, 64]
-        # [B, 512, 64, 64] -> [B, 256, 64, 64] -> [B, 128, 64, 64] -> [B, 128, 128, 128]
-        d = self.upsample(self.res1_d4(self.res2_d4(d, time_emb), time_emb))
-        # Skip connection 2
-        d = torch.concat((d, skip_features[2]), dim=1)    # [B, 128, 128, 128] + [B, 128, 128, 128] = [B, 256, 128, 128]
-        # [B, 256, 128, 128] -> [B, 128, 128, 128] -> [B, 64, 128, 128] -> [B, 64, 256, 256]
-        d = self.upsample(self.res1_d3(self.res2_d3(d, time_emb), time_emb))
-        # Skip connection 3
-        d = torch.concat((d, skip_features[1]), dim=1)    # [B, 64, 256, 256] + [B, 64, 256, 256] = [B, 128, 256, 256]
-        # [B, 128, 256, 256] -> [B, 64, 256, 256] -> [B, 32, 256, 256] -> [B, 32, 512, 512]
-        d = self.upsample(self.res1_d2(self.res2_d2(d, time_emb), time_emb))
-        # Skip connection 4
-        d = torch.concat((d, skip_features[0]), dim=1)  # [B, 32, 512, 512] + [B, 32, 512, 512] = [B, 64, 512, 512]
-        # [B, 64, 512, 512] -> [B, 32, 512, 512] -> [B, base, 512, 512] -> [B, base, 1024, 1024]
-        d = self.upsample(self.res1_d1(self.res2_d1(d, time_emb), time_emb))
+        for block in self.decoder_blocks:
+            x = block(x, time_emb, skip_features)
 
-        return self.linearOut(d)    # [B, base, 1024, 1024] -> [B, 3, 1024, 1024]
+        x = self.linearOut(x)
+        return x
